@@ -1,70 +1,51 @@
-// File: api/echo.js
-// A tiny CORS-friendly proxy for EPA ECHO.
-// Reads API key from env (API_DATA_GOV_KEY) and forwards query params.
-
+// api/echo.js
 export default async function handler(req, res) {
-  // Basic CORS (and preflight) so GitHub Pages / Carrd can call this
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  if (req.method === 'OPTIONS') {
-    res.status(200).end();
-    return;
-  }
-
   try {
-    // Allow a quick health check
-    if (req.query.ping) {
-      res.status(200).json({ ok: true, message: 'echo proxy alive' });
-      return;
+    const API = process.env.API_DATA_GOV_KEY;
+    if (!API) {
+      return res.status(500).json({ ok: false, error: 'Missing env API_DATA_GOV_KEY' });
     }
 
-    // Which ECHO endpoint? default to the cross-program "facility info"
-    const endpoint = (req.query.endpoint || 'rest_services.get_facility_info').toString();
+    // Accept either:
+    //  (A) source=frs & path=<frs path> (default path = v3/facilities)
+    //      plus any FRS query params (state_code, pagesize, etc.)
+    //  (B) url=<full https URL>  (safe-listed hosts only)
+    const { source, path, url, ...rest } = req.query;
 
-    // Base ECHO host (documented under "ECHO Web Services")
-    const base = 'https://echodata.epa.gov/echo';
+    let target = '';
+    const qs = new URLSearchParams(rest);
 
-    // Build a clean query string from the incoming params (except endpoint)
-    const params = new URLSearchParams();
-    for (const [k, v] of Object.entries(req.query)) {
-      if (k === 'endpoint' || k === 'ping') continue;
-      if (Array.isArray(v)) v.forEach(val => params.append(k, val));
-      else params.append(k, v);
-    }
-
-    // Always inject your api.data.gov key
-    const apiKey = process.env.API_DATA_GOV_KEY;
-    if (!apiKey) {
-      res.status(500).json({ ok: false, error: 'Missing env API_DATA_GOV_KEY' });
-      return;
-    }
-    if (!params.has('api_key')) params.append('api_key', apiKey);
-
-    // Default to JSON unless the caller asked for something else
-    if (!params.has('output')) params.append('output', 'JSON');
-
-    const url = `${base}/${endpoint}?${params.toString()}`;
-
-    const r = await fetch(url, { headers: { Accept: 'application/json' } });
-    const contentType = r.headers.get('content-type') || '';
-    const status = r.status;
-
-    if (!r.ok) {
-      const text = await r.text();
-      res.status(status).json({ ok: false, status, body: text });
-      return;
-    }
-
-    if (contentType.includes('application/json')) {
-      const json = await r.json();
-      res.status(status).json(json);
+    if (source === 'frs') {
+      // Default to the modern FRS v3 facilities endpoint
+      const rel = (path && typeof path === 'string') ? path : 'v3/facilities';
+      // Add API key
+      qs.set('api_key', API);
+      target = `https://api.epa.gov/frs/${rel}?${qs.toString()}`;
+    } else if (url) {
+      // Very small allow-list for pass-through mode
+      const allowed = ['api.epa.gov', 'echo.epa.gov', 'enviro.epa.gov'];
+      const u = new URL(url);
+      if (!allowed.includes(u.hostname)) {
+        return res.status(400).json({ ok: false, error: 'Host not allowed in pass-through url' });
+      }
+      // If caller didn’t include api_key and host is api.epa.gov, add it
+      if (u.hostname === 'api.epa.gov' && !u.searchParams.get('api_key')) {
+        u.searchParams.set('api_key', API);
+      }
+      target = u.toString();
     } else {
-      // Rare, but if ECHO returns text/HTML, forward as text
-      const text = await r.text();
-      res.status(status).send(text);
+      return res.status(400).json({ ok: false, error: 'Specify source=frs (preferred) or url=<https URL>' });
     }
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message || String(err) });
+
+    const upstream = await fetch(target, { headers: { 'Accept': 'application/json' } });
+    const text = await upstream.text();
+    let body;
+
+    try { body = JSON.parse(text); }
+    catch { body = text; } // if upstream didn’t send JSON
+
+    return res.status(upstream.status).json({ ok: upstream.ok, status: upstream.status, body });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
-} 
+}
